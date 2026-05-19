@@ -1,11 +1,12 @@
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
 from keyboards.builders import build_inline_keyboard
 from keyboards.reply import ADMIN_MENU
-from services.airtable import sync_parcel_to_airtable
+from services.airtable import sync_delivery_to_airtable, sync_parcel_to_airtable
 from services.delivery import (
     delivery_status_keyboard,
     format_delivery_request_for_admin,
@@ -13,6 +14,8 @@ from services.delivery import (
     get_delivery_requests,
     update_delivery_status,
 )
+from services.settings import get_setting
+from services.status_media import get_status_image_file_id
 from utils.constants import (
     DELIVERY_STATUSES,
 )
@@ -32,6 +35,15 @@ def _is_admin_message(message: Message) -> bool:
 
 def _is_admin_callback(callback: CallbackQuery) -> bool:
     return is_admin(callback.from_user.id)
+
+
+async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return
+        raise
 
 
 def _requests_keyboard(requests):
@@ -210,11 +222,18 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
             except Exception:
                 pass
     if callback.message is not None and request is not None:
-        await callback.message.edit_text(
+        await _safe_edit_text(
+            callback.message,
             format_delivery_request_for_admin(request, request.user),
             reply_markup=delivery_status_keyboard(request.id),
         )
     await callback.answer("Статус нав шуд.")
+
+    if request is not None:
+        try:
+            await sync_delivery_to_airtable(request, request.parcel, request.user)
+        except Exception:
+            logger.exception("Airtable delivery sync failed")
 
     if parcel_for_airtable_sync is not None:
         try:

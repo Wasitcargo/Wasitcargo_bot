@@ -2,6 +2,7 @@ from datetime import date, datetime
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -48,6 +49,15 @@ def _is_admin_message(message: Message) -> bool:
 
 def _is_admin_callback(callback: CallbackQuery) -> bool:
     return is_admin(callback.from_user.id)
+
+
+async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return
+        raise
 
 
 def _format_date(value: datetime | date | None) -> str:
@@ -263,7 +273,11 @@ async def set_single_status(callback: CallbackQuery) -> None:
         text += "\nБа мизоҷ хабар фиристода шуд."
 
     if callback.message is not None:
-        await callback.message.edit_text(text, reply_markup=_status_keyboard(parcel))
+        await _safe_edit_text(
+            callback.message,
+            text,
+            reply_markup=_status_keyboard(parcel),
+        )
     await callback.answer()
     try:
         await sync_parcel_to_airtable(parcel, parcel.user)
