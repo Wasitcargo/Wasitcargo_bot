@@ -145,11 +145,70 @@ def _delivery_status(delivery_request: Any) -> str | None:
     return DELIVERY_STATUS_LABELS_TJ.get(status, str(status))
 
 
-def _invalid_column_from_airtable_error(body: str) -> str | None:
+def _airtable_formula_string(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _invalid_column_from_airtable_error(
+    body: str,
+    fields: dict[str, Any] | None = None,
+) -> str | None:
     match = re.search(r'Field \\"(.+?)\\" cannot accept the provided value', body)
-    if match is None:
+    if match is not None:
+        return match.group(1)
+
+    if fields is None:
         return None
-    return match.group(1)
+
+    for start_marker in ('new select option \\"', 'new select option "'):
+        start = body.find(start_marker)
+        if start == -1:
+            continue
+
+        rest = body[start + len(start_marker):]
+        end_marker = '\\"' if start_marker.endswith('\\"') else '"'
+        end = rest.find(end_marker)
+        if end == -1:
+            continue
+
+        invalid_option = rest[:end]
+        for name, value in fields.items():
+            if str(value) == invalid_option:
+                return name
+
+    return None
+
+
+async def _find_record_id(
+    session: aiohttp.ClientSession,
+    *,
+    url: str,
+    headers: dict[str, str],
+    table_name: str,
+    lookup_field: str,
+    lookup_value: Any,
+) -> str | None:
+    formula = f"{{{lookup_field}}} = '{_airtable_formula_string(lookup_value)}'"
+    params = {
+        "filterByFormula": formula,
+        "maxRecords": "1",
+    }
+
+    async with session.get(url, headers=headers, params=params) as response:
+        if response.status >= 400:
+            body = await response.text()
+            raise RuntimeError(
+                f"Airtable lookup failed for {table_name}: "
+                f"HTTP {response.status} {body[:500]}",
+            )
+
+        data = await response.json()
+        records = data.get("records") or []
+        if not records:
+            return None
+
+        record_id = records[0].get("id")
+        return str(record_id) if record_id else None
 
 
 async def _create_record(
@@ -171,7 +230,38 @@ async def _create_record(
         await response.json()
 
 
-async def _post_record(table_name: str, fields: dict[str, Any]) -> bool:
+async def _update_record(
+    session: aiohttp.ClientSession,
+    *,
+    url: str,
+    headers: dict[str, str],
+    table_name: str,
+    record_id: str,
+    fields: dict[str, Any],
+) -> None:
+    record_url = f"{url}/{quote(record_id, safe='')}"
+    async with session.patch(
+        record_url,
+        headers=headers,
+        json={"fields": fields},
+    ) as response:
+        if response.status >= 400:
+            body = await response.text()
+            raise RuntimeError(
+                f"Airtable update failed for {table_name}: "
+                f"HTTP {response.status} {body[:500]}",
+            )
+
+        await response.json()
+
+
+async def _post_record(
+    table_name: str,
+    fields: dict[str, Any],
+    *,
+    lookup_field: str | None = None,
+    lookup_value: Any = None,
+) -> bool:
     config = _get_config()
     if config is None:
         return False
@@ -190,19 +280,48 @@ async def _post_record(table_name: str, fields: dict[str, Any]) -> bool:
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        record_id = None
+        if lookup_field and lookup_value is not None and str(lookup_value).strip():
+            record_id = await _find_record_id(
+                session,
+                url=url,
+                headers=headers,
+                table_name=table_name,
+                lookup_field=lookup_field,
+                lookup_value=lookup_value,
+            )
+
         while clean_fields:
             try:
-                await _create_record(
-                    session,
-                    url=url,
-                    headers=headers,
-                    table_name=table_name,
-                    fields=clean_fields,
-                )
-                logger.info("Airtable record created in table %s", table_name)
+                if record_id is None:
+                    await _create_record(
+                        session,
+                        url=url,
+                        headers=headers,
+                        table_name=table_name,
+                        fields=clean_fields,
+                    )
+                    logger.info("Airtable record created in table %s", table_name)
+                else:
+                    await _update_record(
+                        session,
+                        url=url,
+                        headers=headers,
+                        table_name=table_name,
+                        record_id=record_id,
+                        fields=clean_fields,
+                    )
+                    logger.info(
+                        "Airtable record updated in table %s: %s",
+                        table_name,
+                        record_id,
+                    )
                 return True
             except RuntimeError as error:
-                invalid_column = _invalid_column_from_airtable_error(str(error))
+                invalid_column = _invalid_column_from_airtable_error(
+                    str(error),
+                    clean_fields,
+                )
                 if invalid_column is None or invalid_column not in clean_fields:
                     raise
 
@@ -219,6 +338,7 @@ async def _post_record(table_name: str, fields: dict[str, Any]) -> bool:
 
 async def sync_user_to_airtable(user: Any) -> bool:
     try:
+        client_code = _read(user, "client_code")
         return await _post_record(
             _table_name("AIRTABLE_USERS_TABLE", DEFAULT_USERS_TABLE),
             {
@@ -234,6 +354,8 @@ async def sync_user_to_airtable(user: Any) -> bool:
                     _read(user, "created_at", "registered_at"),
                 ),
             },
+            lookup_field="Коди мизоҷӣ",
+            lookup_value=client_code,
         )
     except Exception:
         logger.exception("Airtable user sync failed")
@@ -243,10 +365,11 @@ async def sync_user_to_airtable(user: Any) -> bool:
 async def sync_parcel_to_airtable(parcel: Any, user: Any = None) -> bool:
     try:
         parcel_user = user or _read(parcel, "user")
+        track_code = _read(parcel, "track_code")
         return await _post_record(
             _table_name("AIRTABLE_PARCELS_TABLE", DEFAULT_PARCELS_TABLE),
             {
-                "Трек-код": _read(parcel, "track_code"),
+                "Трек-код": track_code,
                 "Коди мизоҷӣ": _read(parcel, "client_code") or _read(parcel_user, "client_code"),
                 "Мизоҷ": _read(parcel_user, "full_name", "name"),
                 "Телефон": _read(parcel_user, "phone"),
@@ -260,6 +383,8 @@ async def sync_parcel_to_airtable(parcel: Any, user: Any = None) -> bool:
                 "Нарх": _read(parcel, "price", "amount", "cost"),
                 "Эзоҳ": _read(parcel, "note", "comment", "description"),
             },
+            lookup_field="Трек-код",
+            lookup_value=track_code,
         )
     except Exception:
         logger.exception("Airtable parcel sync failed")
@@ -274,10 +399,14 @@ async def sync_delivery_to_airtable(
     try:
         request_parcel = parcel or _read(delivery_request, "parcel")
         request_user = user or _read(delivery_request, "user")
+        track_code = _read(delivery_request, "track_code") or _read(
+            request_parcel,
+            "track_code",
+        )
         return await _post_record(
             _table_name("AIRTABLE_DELIVERY_TABLE", DEFAULT_DELIVERY_TABLE),
             {
-                "Трек-код": _read(delivery_request, "track_code") or _read(request_parcel, "track_code"),
+                "Трек-код": track_code,
                 "Коди мизоҷӣ": (
                     _read(request_user, "client_code")
                     or _read(request_parcel, "client_code")
@@ -299,6 +428,8 @@ async def sync_delivery_to_airtable(
                 ),
                 "Эзоҳ": _read(delivery_request, "note", "comment", "description"),
             },
+            lookup_field="Трек-код",
+            lookup_value=track_code,
         )
     except Exception:
         logger.exception("Airtable delivery sync failed")
@@ -307,10 +438,11 @@ async def sync_delivery_to_airtable(
 
 async def sync_daily_stats_to_airtable(stats: Any) -> bool:
     try:
+        stats_date = _as_airtable_date(_read(stats, "Сана", "date", "stats_date", "day"))
         return await _post_record(
             _table_name("AIRTABLE_DAILY_STATS_TABLE", DEFAULT_DAILY_STATS_TABLE),
             {
-                "Сана": _as_airtable_date(_read(stats, "Сана", "date", "stats_date", "day")),
+                "Сана": stats_date,
                 "Мизоҷони нав": _read(
                     stats,
                     "Мизоҷони нав",
@@ -359,6 +491,8 @@ async def sync_daily_stats_to_airtable(stats: Any) -> bool:
                 ),
                 "Эзоҳ": _read(stats, "Эзоҳ", "note", "comment", "description"),
             },
+            lookup_field="Сана",
+            lookup_value=stats_date,
         )
     except Exception:
         logger.exception("Airtable daily stats sync failed")
