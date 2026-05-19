@@ -4,6 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import logging
 import os
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -84,6 +85,27 @@ def _serialize(value: Any) -> Any:
     return value
 
 
+def _as_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _as_airtable_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        return value.split("T", 1)[0]
+    return str(value)
+
+
 def _clean_fields(fields: dict[str, Any]) -> dict[str, Any]:
     return {
         name: serialized
@@ -123,6 +145,32 @@ def _delivery_status(delivery_request: Any) -> str | None:
     return DELIVERY_STATUS_LABELS_TJ.get(status, str(status))
 
 
+def _invalid_column_from_airtable_error(body: str) -> str | None:
+    match = re.search(r'Field \\"(.+?)\\" cannot accept the provided value', body)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+async def _create_record(
+    session: aiohttp.ClientSession,
+    *,
+    url: str,
+    headers: dict[str, str],
+    table_name: str,
+    fields: dict[str, Any],
+) -> None:
+    async with session.post(url, headers=headers, json={"fields": fields}) as response:
+        if response.status >= 400:
+            body = await response.text()
+            raise RuntimeError(
+                f"Airtable create failed for {table_name}: "
+                f"HTTP {response.status} {body[:500]}",
+            )
+
+        await response.json()
+
+
 async def _post_record(table_name: str, fields: dict[str, Any]) -> bool:
     config = _get_config()
     if config is None:
@@ -139,21 +187,34 @@ async def _post_record(table_name: str, fields: dict[str, Any]) -> bool:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload = {"fields": clean_fields}
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=payload) as response:
-            if response.status >= 400:
-                body = await response.text()
-                raise RuntimeError(
-                    f"Airtable create failed for {table_name}: "
-                    f"HTTP {response.status} {body[:500]}",
+        while clean_fields:
+            try:
+                await _create_record(
+                    session,
+                    url=url,
+                    headers=headers,
+                    table_name=table_name,
+                    fields=clean_fields,
+                )
+                logger.info("Airtable record created in table %s", table_name)
+                return True
+            except RuntimeError as error:
+                invalid_column = _invalid_column_from_airtable_error(str(error))
+                if invalid_column is None or invalid_column not in clean_fields:
+                    raise
+
+                clean_fields.pop(invalid_column, None)
+                logger.warning(
+                    "Airtable field skipped for %s: %s cannot accept the value",
+                    table_name,
+                    invalid_column,
                 )
 
-            await response.json()
-            logger.info("Airtable record created in table %s", table_name)
-            return True
+        logger.warning("Airtable sync skipped for %s: no valid fields left", table_name)
+        return False
 
 
 async def sync_user_to_airtable(user: Any) -> bool:
@@ -165,11 +226,13 @@ async def sync_user_to_airtable(user: Any) -> bool:
                 "Ном ва насаб": _read(user, "full_name", "name"),
                 "Телефон": _read(user, "phone"),
                 "Username Telegram": _read(user, "username", "telegram_username"),
-                "Telegram ID": _read(user, "telegram_id"),
+                "Telegram ID": _as_text(_read(user, "telegram_id")),
                 "Забон": _read(user, "language", "lang"),
                 "Шаҳр": _read(user, "city"),
                 "Ҳолат": _read(user, "status"),
-                "Санаи сабти ном": _read(user, "created_at", "registered_at"),
+                "Санаи сабти ном": _as_airtable_date(
+                    _read(user, "created_at", "registered_at"),
+                ),
             },
         )
     except Exception:
@@ -189,8 +252,10 @@ async def sync_parcel_to_airtable(parcel: Any, user: Any = None) -> bool:
                 "Телефон": _read(parcel_user, "phone"),
                 "Склад / Шаҳр": _read(parcel, "destination_city") or _read(parcel_user, "city"),
                 "Статус": _parcel_status(parcel),
-                "Санаи қабул дар Чин": _read(parcel, "received_china_at"),
-                "Санаи расидан": _parcel_arrival_date(parcel),
+                "Санаи қабул дар Чин": _as_airtable_date(
+                    _read(parcel, "received_china_at"),
+                ),
+                "Санаи расидан": _as_airtable_date(_parcel_arrival_date(parcel)),
                 "Вазн": _read(parcel, "weight", "weight_kg"),
                 "Нарх": _read(parcel, "price", "amount", "cost"),
                 "Эзоҳ": _read(parcel, "note", "comment", "description"),
@@ -229,7 +294,9 @@ async def sync_delivery_to_airtable(
                 ),
                 "Адреси доставка": _read(delivery_request, "delivery_address", "address"),
                 "Ҳолати доставка": _delivery_status(delivery_request),
-                "Санаи дархост": _read(delivery_request, "created_at", "requested_at"),
+                "Санаи дархост": _as_airtable_date(
+                    _read(delivery_request, "created_at", "requested_at"),
+                ),
                 "Эзоҳ": _read(delivery_request, "note", "comment", "description"),
             },
         )
@@ -243,7 +310,7 @@ async def sync_daily_stats_to_airtable(stats: Any) -> bool:
         return await _post_record(
             _table_name("AIRTABLE_DAILY_STATS_TABLE", DEFAULT_DAILY_STATS_TABLE),
             {
-                "Сана": _read(stats, "Сана", "date", "stats_date", "day"),
+                "Сана": _as_airtable_date(_read(stats, "Сана", "date", "stats_date", "day")),
                 "Мизоҷони нав": _read(
                     stats,
                     "Мизоҷони нав",
