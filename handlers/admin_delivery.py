@@ -1,8 +1,11 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, Message
 
 from keyboards.builders import build_inline_keyboard
 from keyboards.reply import ADMIN_MENU
+from services.airtable import sync_parcel_to_airtable
 from services.delivery import (
     delivery_status_keyboard,
     format_delivery_request_for_admin,
@@ -17,6 +20,7 @@ from utils.validators import is_admin
 
 
 router = Router(name="admin_delivery")
+logger = logging.getLogger(__name__)
 
 
 ADMIN_DELIVERY_LABEL = ADMIN_MENU[3][1]
@@ -123,6 +127,8 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
 
     request = await get_delivery_request(request_id)
 
+    parcel_for_airtable_sync = None
+
     if (
         request is not None
         and request.user is not None
@@ -173,7 +179,10 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
             try:
                 from services.parcels import update_parcel_status
                 from utils.constants import STATUS_RECEIVED
-                await update_parcel_status(request.parcel_id, STATUS_RECEIVED)
+                parcel_for_airtable_sync = await update_parcel_status(
+                    request.parcel_id,
+                    STATUS_RECEIVED,
+                )
             except Exception:
                 pass
         else:
@@ -206,3 +215,12 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
             reply_markup=delivery_status_keyboard(request.id),
         )
     await callback.answer("Статус нав шуд.")
+
+    if parcel_for_airtable_sync is not None:
+        try:
+            await sync_parcel_to_airtable(
+                parcel_for_airtable_sync,
+                parcel_for_airtable_sync.user,
+            )
+        except Exception:
+            logger.exception("Airtable parcel sync failed")

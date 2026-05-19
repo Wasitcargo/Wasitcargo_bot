@@ -1,3 +1,4 @@
+import logging
 import re
 
 from aiogram import F, Router
@@ -5,6 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from keyboards.builders import build_inline_keyboard
+from services.airtable import sync_delivery_to_airtable
 from services.delivery import (
     create_delivery_request,
     get_arrived_parcel_for_user_by_id,
@@ -20,6 +22,7 @@ from utils.constants import LANG_RU, LANG_TJ
 
 
 router = Router(name="delivery")
+logger = logging.getLogger(__name__)
 
 
 TEXTS = {
@@ -239,3 +242,7 @@ async def confirm_delivery(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message is not None:
         await callback.message.edit_text(_texts(user.language).DELIVERY_REQUEST_ACCEPTED)
     await callback.answer()
+    try:
+        await sync_delivery_to_airtable(request, parcel, user)
+    except Exception:
+        logger.exception("Airtable delivery sync failed")

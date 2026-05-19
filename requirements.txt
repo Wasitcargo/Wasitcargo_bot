@@ -3,3 +3,4 @@ SQLAlchemy
 asyncpg
 python-dotenv
 alembic
+aiohttp

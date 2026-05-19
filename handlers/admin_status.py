@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import logging
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -7,6 +8,7 @@ from aiogram.types import CallbackQuery, Message
 
 from keyboards.builders import build_inline_keyboard
 from keyboards.reply import ADMIN_MENU
+from services.airtable import sync_parcel_to_airtable
 from services.normalizer import normalize_track_code
 from services.notifications import notify_arrival_destination
 from services.parcels import (
@@ -28,6 +30,7 @@ from utils.validators import is_admin
 
 
 router = Router(name="admin_status")
+logger = logging.getLogger(__name__)
 
 
 ADMIN_SEARCH_LABEL = ADMIN_MENU[0][1]
@@ -262,6 +265,10 @@ async def set_single_status(callback: CallbackQuery) -> None:
     if callback.message is not None:
         await callback.message.edit_text(text, reply_markup=_status_keyboard(parcel))
     await callback.answer()
+    try:
+        await sync_parcel_to_airtable(parcel, parcel.user)
+    except Exception:
+        logger.exception("Airtable parcel sync failed")
 
 
 async def _admin_send_parcels_by_status(message, status_code: str, title: str):

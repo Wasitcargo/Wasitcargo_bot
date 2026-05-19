@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message, ReplyKeyboardRemove
@@ -8,6 +10,7 @@ from keyboards.reply import (
     auth_phone_keyboard,
     user_main_menu,
 )
+from services.airtable import sync_user_to_airtable
 from services.normalizer import normalize_full_name
 from services.settings import get_setting
 from services.warehouses import get_active_tj_pickup_warehouses
@@ -25,6 +28,7 @@ from utils.constants import CITY_NAMES, LANG_RU, LANG_TJ
 
 
 router = Router(name="auth")
+logger = logging.getLogger(__name__)
 
 
 TEXTS = {
@@ -316,6 +320,10 @@ async def _continue_after_phone(message: Message, state: FSMContext, *, lang: st
                 texts.REGISTRATION_COMPLETED.format(client_code=user.client_code),
                 reply_markup=user_main_menu(lang),
             )
+            try:
+                await sync_user_to_airtable(user)
+            except Exception:
+                logger.exception("Airtable user sync failed")
             return
 
         if len(warehouses) > 1:
@@ -487,6 +495,10 @@ async def register_city(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=user_main_menu(lang),
     )
     await callback.answer()
+    try:
+        await sync_user_to_airtable(user)
+    except Exception:
+        logger.exception("Airtable user sync failed")
 
 
 @router.message(AuthStates.login_phone, F.contact)

@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import logging
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -6,6 +7,7 @@ from aiogram.types import CallbackQuery, Message
 
 from keyboards.builders import build_inline_keyboard
 from keyboards.reply import ADMIN_MENU, admin_main_menu
+from services.airtable import sync_parcel_to_airtable
 from services.notifications import notify_arrival_destination
 from services.parcels import (
     bulk_update_parcel_status,
@@ -32,6 +34,7 @@ from utils.validators import is_admin
 
 
 router = Router(name="admin_bulk")
+logger = logging.getLogger(__name__)
 
 
 ADMIN_BULK_LABEL = ADMIN_MENU[1][1]
@@ -296,3 +299,9 @@ async def confirm_bulk_status(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.message.edit_text(result)
         await callback.message.answer("Панели админ", reply_markup=admin_main_menu())
     await callback.answer()
+
+    for parcel in parcels:
+        try:
+            await sync_parcel_to_airtable(parcel, parcel.user)
+        except Exception:
+            logger.exception("Airtable parcel sync failed")
