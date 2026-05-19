@@ -14,10 +14,14 @@ from services.delivery import (
     get_delivery_requests,
     update_delivery_status,
 )
+from services.parcels import update_parcel_status
 from services.settings import get_setting
 from services.status_media import get_status_image_file_id
 from utils.constants import (
     DELIVERY_STATUSES,
+    DELIVERY_STATUS_DELIVERED,
+    DELIVERY_STATUS_ON_DELIVERY,
+    STATUS_RECEIVED,
 )
 from utils.validators import is_admin
 
@@ -44,6 +48,25 @@ async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
         if "message is not modified" in str(error).lower():
             return
         raise
+
+
+def _delivery_received_text(language: str) -> str:
+    if language == "ru":
+        return (
+            "✅ <b>Ваш товар получен</b>\n\n"
+            "<blockquote>"
+            "Статус груза изменён на «Получено».\n"
+            "Спасибо, что воспользовались услугами Wasit Cargo!"
+            "</blockquote>"
+        )
+
+    return (
+        "✅ <b>Бори шумо супорида шуд</b>\n\n"
+        "<blockquote>"
+        "Статуси бор ба «Супорида шуд» иваз шуд.\n"
+        "Ташаккур, ки аз хизматрасонии Wasit Cargo истифода бурдед!"
+        "</blockquote>"
+    )
 
 
 def _requests_keyboard(requests):
@@ -139,18 +162,27 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
 
     request = await get_delivery_request(request_id)
 
+    status_changed = before_request is not None and before_request.status != status
     parcel_for_airtable_sync = None
+
+    if request is not None and status == DELIVERY_STATUS_DELIVERED and status_changed:
+        try:
+            parcel_for_airtable_sync = await update_parcel_status(
+                request.parcel_id,
+                STATUS_RECEIVED,
+            )
+        except Exception:
+            logger.exception("Failed to mark parcel as received after delivery")
 
     if (
         request is not None
         and request.user is not None
         and request.user.telegram_id
-        and before_request is not None
-        and before_request.status != status
+        and status_changed
     ):
         bot = callback.message.bot if callback.message is not None else callback.bot
 
-        if status == "on_delivery":
+        if status == DELIVERY_STATUS_ON_DELIVERY:
             if request.user.language == "ru":
                 text = (
                     "🚚 <b>Доставка в пути</b>\n\n"
@@ -169,41 +201,16 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
                 )
             image_key = "delivery_on_the_way_image_file_id"
 
-        elif status == "delivered":
-            if request.user.language == "ru":
-                text = (
-                    "✅ <b>Товар получен</b>\n\n"
-                    "<blockquote>"
-                    "Вы получили товар через доставку.\n"
-                    "🤝 Спасибо за доверие к Wasit Cargo!"
-                    "</blockquote>"
-                )
-            else:
-                text = (
-                    "✅ <b>Товар қабул шуд</b>\n\n"
-                    "<blockquote>"
-                    "Шумо товарро тавассути доставка қабул кардед.\n"
-                    "🤝 Ташаккур барои боварӣ ба Wasit Cargo!"
-                    "</blockquote>"
-                )
-            image_key = "delivery_delivered_image_file_id"
-
-            try:
-                from services.parcels import update_parcel_status
-                from utils.constants import STATUS_RECEIVED
-                parcel_for_airtable_sync = await update_parcel_status(
-                    request.parcel_id,
-                    STATUS_RECEIVED,
-                )
-            except Exception:
-                pass
+        elif status == DELIVERY_STATUS_DELIVERED:
+            text = _delivery_received_text(request.user.language)
+            image_key = None
         else:
             text = None
             image_key = None
 
         if text:
             try:
-                if status == "delivered":
+                if status == DELIVERY_STATUS_DELIVERED:
                     image_id = await get_status_image_file_id(STATUS_RECEIVED)
                 else:
                     image_id = await get_setting(image_key, "") if image_key else ""
@@ -220,7 +227,7 @@ async def set_delivery_status(callback: CallbackQuery) -> None:
                         text=text,
                     )
             except Exception:
-                pass
+                logger.exception("Failed to notify user about delivery status")
     if callback.message is not None and request is not None:
         await _safe_edit_text(
             callback.message,
